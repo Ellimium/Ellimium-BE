@@ -1,6 +1,6 @@
 begin;
 
-select plan(13);
+select plan(12);
 
 select has_table('public', 'assets', 'assets table exists');
 select col_is_pk('public', 'assets', 'id', 'asset id is the primary key');
@@ -35,16 +35,11 @@ select results_eq(
   'users can only read their own unreferenced assets'
 );
 
-select lives_ok(
-  $$insert into public.assets (owner_id, category, storage_path) values ('00000000-0000-0000-0000-000000000050', 'item', '00000000-0000-0000-0000-000000000050/new.png')$$,
-  'users can create their own asset metadata'
-);
-
 select throws_ok(
-  $$insert into public.assets (owner_id, category, storage_path) values ('00000000-0000-0000-0000-000000000050', 'item', '00000000-0000-0000-0000-000000000051/invalid.png')$$,
-  '23514',
+  $$insert into public.assets (owner_id, category, storage_path) values ('00000000-0000-0000-0000-000000000050', 'item', '00000000-0000-0000-0000-000000000050/new.png')$$,
+  '42501',
   null,
-  'asset metadata paths must belong to their owner'
+  'users cannot bypass the upload function for asset metadata'
 );
 
 select throws_ok(
@@ -54,11 +49,16 @@ select throws_ok(
   'users cannot create another user asset metadata'
 );
 
-select results_eq(
-  $$update public.assets set category = 'other' where owner_id = '00000000-0000-0000-0000-000000000051' returning storage_path$$,
-  $$select null::text where false$$,
-  'users cannot update another user asset metadata'
+set local role postgres;
+select throws_ok(
+  $$insert into public.assets (owner_id, category, storage_path) values ('00000000-0000-0000-0000-000000000050', 'item', '00000000-0000-0000-0000-000000000051/invalid.png')$$,
+  '23514',
+  null,
+  'asset metadata paths must belong to their owner'
 );
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000050', true);
 
 select results_eq(
   $$select name from storage.objects where bucket_id = 'assets' order by name$$,
@@ -66,9 +66,11 @@ select results_eq(
   'users can only read files in their own asset folder'
 );
 
-select lives_ok(
+select throws_ok(
   $$insert into storage.objects (bucket_id, name) values ('assets', '00000000-0000-0000-0000-000000000050/new.png')$$,
-  'users can upload into their own asset folder'
+  '42501',
+  null,
+  'users cannot bypass the upload function for asset files'
 );
 
 select throws_ok(
