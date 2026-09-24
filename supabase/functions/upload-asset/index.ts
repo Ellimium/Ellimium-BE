@@ -16,10 +16,7 @@ const corsHeaders = {
 };
 
 const wasmBytes = await Deno.readFile(
-  new URL(
-    "magick.wasm",
-    import.meta.resolve("npm:@imagemagick/magick-wasm@^0"),
-  ),
+  new URL(import.meta.resolve("npm:@imagemagick/magick-wasm@^0/magick.wasm")),
 );
 await initializeImageMagick(wasmBytes);
 

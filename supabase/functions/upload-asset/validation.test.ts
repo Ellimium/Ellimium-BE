@@ -43,6 +43,8 @@ Deno.test("accepts each supported image signature", () => {
 Deno.test("rejects unknown formats and oversized uploads", () => {
   let invalidFormat = false;
   let oversizedToken = false;
+  let oversizedMap = false;
+  let oversizedThumbnail = false;
   try {
     validateThumbnail(new Uint8Array([0]));
   } catch {
@@ -53,6 +55,18 @@ Deno.test("rejects unknown formats and oversized uploads", () => {
   } catch {
     oversizedToken = true;
   }
+  try {
+    validateAsset("map", new Uint8Array(10 * 1024 * 1024 + 1));
+  } catch {
+    oversizedMap = true;
+  }
+  try {
+    validateThumbnail(new Uint8Array(5 * 1024 * 1024 + 1));
+  } catch {
+    oversizedThumbnail = true;
+  }
   assert(invalidFormat, "unknown thumbnails must be rejected");
   assert(oversizedToken, "tokens over 5MB must be rejected");
+  assert(oversizedMap, "maps over 10MB must be rejected");
+  assert(oversizedThumbnail, "thumbnails over 5MB must be rejected");
 });
