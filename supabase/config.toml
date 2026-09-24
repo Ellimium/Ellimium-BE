@@ -116,6 +116,9 @@ enabled = true
 # The maximum file size allowed (e.g. "5MB", "500KB").
 file_size_limit = "50MiB"
 
+[functions.upload-asset]
+verify_jwt = false
+
 # Uncomment to configure local storage buckets
 # [storage.buckets.images]
 # public = false
