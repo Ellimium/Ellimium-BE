@@ -1,6 +1,6 @@
 begin;
 
-select plan(40);
+select plan(42);
 
 select has_table('public', 'dice_rolls', 'dice rolls table exists');
 select has_function('public', 'roll_dice', array['uuid', 'text'], 'dice roll function exists');
@@ -94,9 +94,13 @@ select ok(
     select 1
     from returned_roll as returned
     join public.dice_rolls as stored using (id)
-    where returned.roller_id = '00000000-0000-0000-0000-0000000000c0'
+    join public.profiles as roller on roller.user_id = stored.roller_id
+    where returned.room_id = (select id from test_room)
+      and returned.roller_id = '00000000-0000-0000-0000-0000000000c0'
+      and roller.nickname = '다이스마스터'
       and returned.expression = '/roll 2d6+3'
       and jsonb_array_length(returned.individual_results) = 2
+      and returned.created_at is not null
       and returned.total = (
         select sum(value::bigint) + 3
         from jsonb_array_elements_text(returned.individual_results) as results(value)
@@ -272,6 +276,33 @@ select results_eq(
   $$select count(*) from public.dice_rolls where room_id = (select id from test_room)$$,
   $$values (6::bigint)$$,
   'invalid rolls do not leave logs'
+);
+
+set local role postgres;
+
+with numbered_rolls as (
+  select id, row_number() over (order by expression, id) as position
+  from public.dice_rolls
+  where room_id = (select id from test_room)
+)
+update public.dice_rolls as roll
+set created_at = timestamptz '2026-09-27 00:00:00+00' + numbered.position * interval '1 minute'
+from numbered_rolls as numbered
+where roll.id = numbered.id;
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c1', true);
+
+select results_eq(
+  $$select created_at from public.dice_rolls where room_id = (select id from test_room) order by created_at desc$$,
+  $$select timestamptz '2026-09-27 00:00:00+00' + position * interval '1 minute' from generate_series(6, 1, -1) as positions(position)$$,
+  'room members can read dice rolls in reverse chronological order'
+);
+
+select results_eq(
+  $$select expression from public.dice_rolls where room_id = (select id from test_room) and roller_id = '00000000-0000-0000-0000-0000000000c1' order by expression$$,
+  $$values ('100d1'::text), ('1d1-9223372036854775808'), ('1d4294967296'), ('4d6kH3'), ('4d6kL2-1')$$,
+  'room members can filter dice rolls by roller'
 );
 
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c2', true);
