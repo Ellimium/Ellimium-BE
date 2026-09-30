@@ -32,6 +32,36 @@ function bytesPart(bytes: Uint8Array) {
   return Uint8Array.from(bytes).buffer;
 }
 
+Deno.test("allows Supabase client CORS preflight", async () => {
+  const response = await fetch(`${apiUrl}/functions/v1/upload-asset`, {
+    method: "OPTIONS",
+    headers: {
+      "Access-Control-Request-Headers":
+        "authorization, x-client-info, apikey, content-type",
+      "Access-Control-Request-Method": "POST",
+      Origin: "http://localhost:3000",
+    },
+  });
+
+  assert(response.ok, `preflight failed with ${response.status}`);
+  assert(
+    response.headers.get("Access-Control-Allow-Headers") ===
+      "authorization, x-client-info, apikey, content-type",
+    "preflight did not allow Supabase client headers",
+  );
+  assert(
+    response.headers.get("Access-Control-Allow-Methods")?.split(",").includes(
+      "POST",
+    ),
+    "preflight did not allow POST",
+  );
+
+  const rejected = await fetch(`${apiUrl}/functions/v1/upload-asset`, {
+    method: "DELETE",
+  });
+  assert(rejected.status === 405, "unsupported method was not rejected");
+});
+
 async function user(label: string) {
   const client = createClient(apiUrl!, anonKey!, {
     auth: {
