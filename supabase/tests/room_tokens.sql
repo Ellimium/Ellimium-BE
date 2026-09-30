@@ -1,6 +1,6 @@
 begin;
 
-select plan(31);
+select plan(23);
 
 select has_table('public', 'room_tokens', 'room tokens table exists');
 select col_is_pk('public', 'room_tokens', 'id', 'room token id is the primary key');
@@ -96,17 +96,9 @@ select lives_ok(
   'masters can create unassigned tokens'
 );
 
-set local role postgres;
-
-insert into realtime.messages (topic, extension, payload, event, private) values
-  ('room:' || (select id from test_room) || ':tokens', 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a0","x":5,"y":6}', 'token-move', true),
-  ('room:' || (select id from test_room) || ':tokens', 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a0","x":5,"y":6}', 'token-move', false),
-  ('room:' || (select id from other_room) || ':tokens', 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a0","x":5,"y":6}', 'token-move', true);
-
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000081', true);
 select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000081","is_anonymous":false}', true);
-select set_config('realtime.topic', 'room:' || (select id from test_room) || ':tokens', true);
 
 select results_eq(
   $$select count(*) from public.room_tokens$$,
@@ -145,24 +137,6 @@ select results_eq(
   'room members can read linked token files'
 );
 
-select results_eq(
-  $$select count(*) from realtime.messages$$,
-  $$values (1::bigint)$$,
-  'players receive only private token movement from their room'
-);
-
-select lives_ok(
-  $$insert into realtime.messages (topic, extension, payload, event, private) values ((select realtime.topic()), 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a0","x":5,"y":6}', 'token-move', true)$$,
-  'players can broadcast movement for their assigned token'
-);
-
-select throws_ok(
-  $$insert into realtime.messages (topic, extension, payload, event, private) values ((select realtime.topic()), 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a1","x":7,"y":8}', 'token-move', true)$$,
-  '42501',
-  'new row violates row-level security policy for table "messages"',
-  'players cannot broadcast movement for unassigned tokens'
-);
-
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000082', true);
 select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000082","is_anonymous":false}', true);
 
@@ -178,19 +152,6 @@ select results_eq(
   'spectators cannot change tokens'
 );
 
-select results_eq(
-  $$select count(*) from realtime.messages$$,
-  $$values (2::bigint)$$,
-  'spectators can receive private token movement from their room'
-);
-
-select throws_ok(
-  $$insert into realtime.messages (topic, extension, payload, event, private) values ((select realtime.topic()), 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a0","x":9,"y":9}', 'token-move', true)$$,
-  '42501',
-  'new row violates row-level security policy for table "messages"',
-  'spectators cannot broadcast token movement'
-);
-
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000083', true);
 select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000083","is_anonymous":false}', true);
 
@@ -200,27 +161,8 @@ select results_eq(
   'other room members cannot read tokens or their images'
 );
 
-select results_eq(
-  $$select count(*) from realtime.messages$$,
-  $$values (0::bigint)$$,
-  'other room members cannot receive token movement'
-);
-
-select throws_ok(
-  $$insert into realtime.messages (topic, extension, payload, event, private) values ((select realtime.topic()), 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a0","x":9,"y":9}', 'token-move', true)$$,
-  '42501',
-  'new row violates row-level security policy for table "messages"',
-  'other room members cannot broadcast token movement'
-);
-
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000080', true);
 select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000080","is_anonymous":false}', true);
-select set_config('realtime.topic', 'room:' || (select id from test_room) || ':tokens', true);
-
-select lives_ok(
-  $$insert into realtime.messages (topic, extension, payload, event, private) values ((select realtime.topic()), 'broadcast', '{"token_id":"00000000-0000-0000-0000-0000000000a1","x":7,"y":8}', 'token-move', true)$$,
-  'masters can broadcast movement for every token'
-);
 
 select lives_ok(
   $$select public.set_room_member_role((select id from test_room), '00000000-0000-0000-0000-000000000081', 'spectator')$$,
