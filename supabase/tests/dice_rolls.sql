@@ -1,9 +1,13 @@
 begin;
 
-select plan(42);
+select plan(64);
 
 select has_table('public', 'dice_rolls', 'dice rolls table exists');
+select has_table('public', 'dice_roll_notifications', 'dice roll notifications table exists');
+select has_column('public', 'dice_rolls', 'visibility', 'dice rolls record their visibility');
+select has_column('public', 'dice_roll_notifications', 'visibility', 'dice roll notifications record their visibility');
 select has_function('public', 'roll_dice', array['uuid', 'text'], 'dice roll function exists');
+select has_function('public', 'roll_dice', array['uuid', 'text', 'text'], 'visibility-aware dice roll function exists');
 
 select ok(
   has_function_privilege('authenticated', 'public.roll_dice(uuid, text)', 'execute'),
@@ -13,6 +17,16 @@ select ok(
 select ok(
   not has_function_privilege('anon', 'public.roll_dice(uuid, text)', 'execute'),
   'anonymous users cannot execute dice rolls'
+);
+
+select ok(
+  has_function_privilege('authenticated', 'public.roll_dice(uuid, text, text)', 'execute'),
+  'authenticated users can execute visibility-aware dice rolls'
+);
+
+select ok(
+  not has_function_privilege('anon', 'public.roll_dice(uuid, text, text)', 'execute'),
+  'anonymous users cannot execute visibility-aware dice rolls'
 );
 
 select ok(
@@ -28,6 +42,22 @@ select ok(
 select ok(
   not has_table_privilege('authenticated', 'public.dice_rolls', 'insert'),
   'authenticated users cannot insert dice rolls directly'
+);
+
+select ok(
+  has_table_privilege('authenticated', 'public.dice_roll_notifications', 'select'),
+  'authenticated users can read authorized dice roll notifications'
+);
+
+select ok(
+  not has_table_privilege('authenticated', 'public.dice_roll_notifications', 'insert'),
+  'authenticated users cannot insert dice roll notifications directly'
+);
+
+select results_eq(
+  $$select count(*) from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename in ('dice_rolls', 'dice_roll_notifications')$$,
+  $$values (2::bigint)$$,
+  'dice roll details and notifications are published for realtime delivery'
 );
 
 select results_eq(
@@ -68,7 +98,8 @@ insert into auth.users (
   ('00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-0000000000c0', 'authenticated', 'authenticated', 'dice-master@example.com', '', now(), '{"provider":"email","providers":["email"]}', '{"nickname":"다이스마스터"}', '', '', '', ''),
   ('00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-0000000000c1', 'authenticated', 'authenticated', 'dice-player@example.com', '', now(), '{"provider":"email","providers":["email"]}', '{"nickname":"다이스플레이어"}', '', '', '', ''),
   ('00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-0000000000c2', 'authenticated', 'authenticated', 'dice-spectator@example.com', '', now(), '{"provider":"email","providers":["email"]}', '{"nickname":"다이스관전자"}', '', '', '', ''),
-  ('00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-0000000000c3', 'authenticated', 'authenticated', 'dice-outsider@example.com', '', now(), '{"provider":"email","providers":["email"]}', '{"nickname":"다이스외부인"}', '', '', '', '');
+  ('00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-0000000000c3', 'authenticated', 'authenticated', 'dice-outsider@example.com', '', now(), '{"provider":"email","providers":["email"]}', '{"nickname":"다이스외부인"}', '', '', '', ''),
+  ('00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-0000000000c4', 'authenticated', 'authenticated', 'dice-other-player@example.com', '', now(), '{"provider":"email","providers":["email"]}', '{"nickname":"다이스다른플레이어"}', '', '', '', '');
 
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c0', true);
@@ -81,7 +112,8 @@ set local role postgres;
 
 insert into public.room_members (room_id, user_id, role) values
   ((select id from test_room), '00000000-0000-0000-0000-0000000000c1', 'player'),
-  ((select id from test_room), '00000000-0000-0000-0000-0000000000c2', 'spectator');
+  ((select id from test_room), '00000000-0000-0000-0000-0000000000c2', 'spectator'),
+  ((select id from test_room), '00000000-0000-0000-0000-0000000000c4', 'player');
 
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c0', true);
@@ -348,6 +380,89 @@ select results_eq(
   $$select count(*) from public.dice_rolls where room_id = (select id from test_room)$$,
   $$values (6::bigint)$$,
   'permission failures do not leave logs'
+);
+
+create temporary table returned_private_roll as
+select * from public.roll_dice((select id from test_room), '1d20', 'private');
+
+select ok(
+  exists (
+    select 1
+    from returned_private_roll
+    where roller_id = '00000000-0000-0000-0000-0000000000c1'
+      and visibility = 'private'
+      and jsonb_array_length(individual_results) = 1
+      and total = (individual_results ->> 0)::bigint
+  ),
+  'the roller receives the private result'
+);
+
+select results_eq(
+  $$select visibility, count(*) from public.dice_rolls where room_id = (select id from test_room) group by visibility order by visibility$$,
+  $$values ('private'::text, 1::bigint), ('public'::text, 6::bigint)$$,
+  'the roller can query logs by public and private visibility'
+);
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c0', true);
+
+select results_eq(
+  $$select count(*) from public.dice_rolls where id = (select id from returned_private_roll) and visibility = 'private'$$,
+  $$values (1::bigint)$$,
+  'the master can read private roll details'
+);
+
+select results_eq(
+  $$select count(*) from public.dice_roll_notifications where id = (select id from returned_private_roll) and visibility = 'private'$$,
+  $$values (1::bigint)$$,
+  'the master receives the private roll notification'
+);
+
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c4', true);
+
+select results_eq(
+  $$select count(*) from public.dice_rolls where id = (select id from returned_private_roll)$$,
+  $$values (0::bigint)$$,
+  'another player cannot read private roll details'
+);
+
+select results_eq(
+  $$select room_id, roller_id, visibility from public.dice_roll_notifications where id = (select id from returned_private_roll)$$,
+  $$values ((select id from test_room), '00000000-0000-0000-0000-0000000000c1'::uuid, 'private'::text)$$,
+  'another player receives a result-free private roll notification'
+);
+
+select hasnt_column('public', 'dice_roll_notifications', 'expression', 'notifications do not expose dice expressions');
+select hasnt_column('public', 'dice_roll_notifications', 'individual_results', 'notifications do not expose individual results');
+select hasnt_column('public', 'dice_roll_notifications', 'total', 'notifications do not expose totals');
+
+select results_eq(
+  $$select count(*) from public.dice_rolls where room_id = (select id from test_room) and visibility = 'public'$$,
+  $$values (6::bigint)$$,
+  'another player can still read public roll details'
+);
+
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c3', true);
+
+select results_eq(
+  $$select count(*) from public.dice_roll_notifications$$,
+  $$values (0::bigint)$$,
+  'non-members cannot receive dice roll notifications'
+);
+
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c1', true);
+
+select throws_ok(
+  $$select public.roll_dice((select id from test_room), '1d20', 'secret')$$,
+  '22023',
+  'invalid dice visibility',
+  'unsupported dice visibility is rejected'
+);
+
+select results_eq(
+  $$select count(*) from public.dice_rolls where room_id = (select id from test_room)$$,
+  $$values (7::bigint)$$,
+  'invalid visibility does not leave a roll'
 );
 
 select * from finish();
