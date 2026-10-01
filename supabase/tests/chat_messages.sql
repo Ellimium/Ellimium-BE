@@ -1,6 +1,6 @@
 begin;
 
-select plan(35);
+select plan(46);
 
 select has_table('public', 'chat_messages', 'chat messages table exists');
 select col_is_pk('public', 'chat_messages', 'id', 'chat message id is the primary key');
@@ -8,11 +8,28 @@ select col_is_fk('public', 'chat_messages', 'room_id', 'chat message references 
 select col_is_fk('public', 'chat_messages', 'sender_id', 'chat message references its sender');
 select col_is_fk('public', 'chat_messages', 'character_id', 'chat message optionally references a character');
 select has_column('public', 'chat_messages', 'character_name', 'chat messages preserve the speaking character name');
+select has_column('public', 'chat_messages', 'message_type', 'chat messages distinguish chat and system messages');
+select has_column('public', 'chat_messages', 'event_type', 'system messages identify their event type');
+select has_column('public', 'chat_messages', 'event_data', 'system messages store structured event data');
 select has_function(
   'public',
   'send_chat_message',
   array['uuid', 'text', 'text', 'uuid'],
   'chat message function exists'
+);
+select has_function(
+  'private',
+  'record_system_message',
+  array['uuid', 'text', 'text', 'jsonb', 'uuid'],
+  'internal system message function exists'
+);
+select ok(
+  not (
+    select prosecdef
+    from pg_proc
+    where oid = 'private.record_system_message(uuid, text, text, jsonb, uuid)'::regprocedure
+  ),
+  'the system message function runs with caller privileges'
 );
 select ok(
   (select relrowsecurity from pg_class where oid = 'public.chat_messages'::regclass),
@@ -49,6 +66,22 @@ select ok(
     'execute'
   ),
   'anonymous users cannot call the chat message function'
+);
+select ok(
+  not has_function_privilege(
+    'authenticated',
+    'private.record_system_message(uuid, text, text, jsonb, uuid)',
+    'execute'
+  ),
+  'authenticated users cannot call the system message function'
+);
+select ok(
+  not has_function_privilege(
+    'anon',
+    'private.record_system_message(uuid, text, text, jsonb, uuid)',
+    'execute'
+  ),
+  'anonymous users cannot call the system message function'
 );
 select results_eq(
   $$select count(*) from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'chat_messages'$$,
@@ -95,8 +128,57 @@ insert into public.chat_messages (room_id, sender_id, mode, content, created_at)
   ((select id from test_room), '00000000-0000-0000-0000-0000000000e0', 'general', '먼저 저장된 메시지', '2026-01-01 00:00:00+00'),
   ((select id from test_room), '00000000-0000-0000-0000-0000000000e0', 'general', '나중에 저장된 메시지', '2026-01-02 00:00:00+00');
 
+create temporary table returned_system_message as
+select * from private.record_system_message(
+  (select id from test_room),
+  'notification',
+  '세션이 곧 시작됩니다.',
+  '{"level":"info"}'::jsonb
+);
+
+select ok(
+  exists (
+    select 1
+    from returned_system_message as returned
+    join public.chat_messages as stored using (id)
+    where returned.room_id = (select id from test_room)
+      and returned.sender_id is null
+      and returned.character_id is null
+      and returned.character_name is null
+      and returned.mode = 'general'
+      and returned.content = '세션이 곧 시작됩니다.'
+      and returned.message_type = 'system'
+      and returned.event_type = 'notification'
+      and returned.event_data = '{"level":"info"}'::jsonb
+      and returned.message_type = stored.message_type
+      and returned.event_type = stored.event_type
+      and returned.event_data = stored.event_data
+  ),
+  'the internal function stores a structured system message'
+);
+
+select throws_ok(
+  $$select private.record_system_message((select id from test_room), 'unknown', '잘못된 이벤트')$$,
+  '22023',
+  'invalid system event type',
+  'unknown system event types are rejected'
+);
+
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000e1', true);
+
+select results_eq(
+  $$select message_type, event_type, event_data from public.chat_messages where message_type = 'system'$$,
+  $$values ('system'::text, 'notification'::text, '{"level":"info"}'::jsonb)$$,
+  'active members can read system messages in their room'
+);
+
+select throws_ok(
+  $$select private.record_system_message((select id from test_room), 'notification', '위조된 시스템 메시지')$$,
+  '42501',
+  'permission denied for schema private',
+  'authenticated users cannot record system messages'
+);
 
 create temporary table returned_message as
 select * from public.send_chat_message(
@@ -192,7 +274,7 @@ select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000e3
 
 select results_eq(
   $$select count(*) from public.chat_messages$$,
-  $$values (6::bigint)$$,
+  $$values (7::bigint)$$,
   'spectators can read every stored message in their room'
 );
 
