@@ -1,6 +1,6 @@
 begin;
 
-select plan(15);
+select plan(17);
 
 insert into auth.users (
   instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
@@ -116,12 +116,24 @@ select results_eq(
   'force-removed users are excluded from common member access'
 );
 
+select results_eq(
+  $$select count(*) from public.chat_messages$$,
+  $$values (0::bigint)$$,
+  'force-removed users cannot read their departure event'
+);
+
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000050', true);
 
 select results_eq(
   $$select user_id from public.room_members where room_id = (select id from test_room) order by user_id$$,
   $$values ('00000000-0000-0000-0000-000000000050'::uuid)$$,
   'active members no longer see force-removed participants'
+);
+
+select results_eq(
+  $$select sender_id, event_data ->> 'status' from public.chat_messages where event_type = 'member_left'$$,
+  $$values ('00000000-0000-0000-0000-000000000051'::uuid, 'removed'::text)$$,
+  'active members receive force-removal events'
 );
 
 select * from finish();

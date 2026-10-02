@@ -1,6 +1,6 @@
 begin;
 
-select plan(16);
+select plan(21);
 
 insert into auth.users (
   instance_id, id, aud, role, email, encrypted_password, email_confirmed_at,
@@ -84,6 +84,12 @@ select results_eq(
 );
 
 select results_eq(
+  $$select count(*) from public.chat_messages where event_type = 'member_joined' and sender_id = '00000000-0000-0000-0000-000000000041'$$,
+  $$values (1::bigint)$$,
+  'joining records one member event'
+);
+
+select results_eq(
   $$select name from public.rooms where id = (select id from test_room)$$,
   $$values ('참가 테스트 룸'::text)$$,
   'members can read the room after joining'
@@ -122,6 +128,12 @@ select results_eq(
   'departed members rejoin without changing their role'
 );
 
+select results_eq(
+  $$select count(*) from public.chat_messages where event_type = 'member_joined' and sender_id = '00000000-0000-0000-0000-000000000041'$$,
+  $$values (2::bigint)$$,
+  'rejoining after leaving records another member event'
+);
+
 set local role postgres;
 update public.room_members
 set status = 'removed'
@@ -143,6 +155,12 @@ select results_eq(
   'removed members rejoin without changing their role'
 );
 
+select results_eq(
+  $$select count(*) from public.chat_messages where event_type = 'member_joined' and sender_id = '00000000-0000-0000-0000-000000000041'$$,
+  $$values (3::bigint)$$,
+  'rejoining after removal records another member event'
+);
+
 do $$
 begin
   perform public.join_room((select invite_code from test_room))
@@ -154,6 +172,12 @@ select results_eq(
   $$select count(*) from public.room_members where room_id = (select id from test_room) and user_id = '00000000-0000-0000-0000-000000000041'$$,
   $$values (1::bigint)$$,
   'duplicate join requests keep one membership row'
+);
+
+select results_eq(
+  $$select count(*) from public.chat_messages where event_type = 'member_joined' and sender_id = '00000000-0000-0000-0000-000000000041'$$,
+  $$values (3::bigint)$$,
+  'duplicate joins do not record duplicate member events'
 );
 
 set local role authenticated;
@@ -170,6 +194,12 @@ select results_eq(
   $$select count(*) from storage.objects where name = '00000000-0000-0000-0000-000000000040/avatar'$$,
   $$values (0::bigint)$$,
   'non-members still cannot read member avatars'
+);
+
+select results_eq(
+  $$select count(*) from public.chat_messages$$,
+  $$values (0::bigint)$$,
+  'non-members cannot read member events'
 );
 
 select * from finish();

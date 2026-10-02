@@ -1,6 +1,6 @@
 begin;
 
-select plan(64);
+select plan(67);
 
 select has_table('public', 'dice_rolls', 'dice rolls table exists');
 select has_table('public', 'dice_roll_notifications', 'dice roll notifications table exists');
@@ -139,6 +139,22 @@ select ok(
       )
   ),
   'masters receive the same standard roll that is stored'
+);
+
+select ok(
+  exists (
+    select 1
+    from public.chat_messages as message
+    join returned_roll as roll
+      on message.event_data ->> 'roll_id' = roll.id::text
+    where message.event_type = 'dice_roll'
+      and message.sender_id = roll.roller_id
+      and message.event_data ->> 'visibility' = 'public'
+      and message.event_data ->> 'expression' = roll.expression
+      and message.event_data -> 'individual_results' = roll.individual_results
+      and (message.event_data ->> 'total')::bigint = roll.total
+  ),
+  'public dice rolls record complete system events'
 );
 
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c1', true);
@@ -367,6 +383,12 @@ select results_eq(
   'non-members cannot read dice rolls'
 );
 
+select results_eq(
+  $$select count(*) from public.chat_messages where event_type = 'dice_roll'$$,
+  $$values (0::bigint)$$,
+  'non-members cannot read dice roll system events'
+);
+
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-0000000000c1', true);
 
 select throws_ok(
@@ -430,6 +452,20 @@ select results_eq(
   $$select room_id, roller_id, visibility from public.dice_roll_notifications where id = (select id from returned_private_roll)$$,
   $$values ((select id from test_room), '00000000-0000-0000-0000-0000000000c1'::uuid, 'private'::text)$$,
   'another player receives a result-free private roll notification'
+);
+
+select ok(
+  exists (
+    select 1
+    from public.chat_messages
+    where event_type = 'dice_roll'
+      and event_data ->> 'roll_id' = (select id::text from returned_private_roll)
+      and event_data ->> 'visibility' = 'private'
+      and not event_data ? 'expression'
+      and not event_data ? 'individual_results'
+      and not event_data ? 'total'
+  ),
+  'private dice system events do not expose roll details'
 );
 
 select hasnt_column('public', 'dice_roll_notifications', 'expression', 'notifications do not expose dice expressions');
