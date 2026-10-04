@@ -1,5 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { validateMusicFile } from "./validation.ts";
+import { MusicUploadError, storageUploadError } from "./errors.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Headers":
@@ -49,6 +50,7 @@ Deno.serve(async (request) => {
   const musicAssetId = crypto.randomUUID();
   const storagePath = `${user.id}/${musicAssetId}`;
   let objectPath: string | null = null;
+  let metadataInsertAttempted = false;
 
   try {
     const formData = await request.formData();
@@ -74,8 +76,9 @@ Deno.serve(async (request) => {
         contentType: type.contentType,
         upsert: false,
       });
-    if (uploadError) throw new Error("music file could not be stored");
+    if (uploadError) throw storageUploadError(uploadError);
 
+    metadataInsertAttempted = true;
     const { data: musicAsset, error: metadataError } = await adminClient
       .from("music_assets")
       .insert({
@@ -89,16 +92,24 @@ Deno.serve(async (request) => {
       })
       .select()
       .single();
-    if (metadataError) throw new Error("music metadata could not be saved");
+    if (metadataError) {
+      throw new MusicUploadError(
+        "music metadata could not be saved",
+        500,
+        "metadata_save_failed",
+      );
+    }
 
     return json({ musicAsset }, 201);
   } catch (error) {
     const cleanupErrors: string[] = [];
-    const { error: metadataCleanupError } = await adminClient
-      .from("music_assets")
-      .delete()
-      .eq("id", musicAssetId);
-    if (metadataCleanupError) cleanupErrors.push("metadata");
+    if (metadataInsertAttempted) {
+      const { error: metadataCleanupError } = await adminClient
+        .from("music_assets")
+        .delete()
+        .eq("id", musicAssetId);
+      if (metadataCleanupError) cleanupErrors.push("metadata");
+    }
 
     if (objectPath) {
       const { error: storageCleanupError } = await adminClient.storage
@@ -110,12 +121,18 @@ Deno.serve(async (request) => {
     if (cleanupErrors.length) {
       console.error("Music upload cleanup failed", cleanupErrors);
       return json(
-        { error: "music upload failed and cleanup needs attention" },
+        {
+          error: "music upload failed and cleanup needs attention",
+          code: "cleanup_failed",
+        },
         500,
       );
     }
     return json({
       error: error instanceof Error ? error.message : "music upload failed",
-    }, 400);
+      code: error instanceof MusicUploadError
+        ? error.code
+        : "invalid_music_file",
+    }, error instanceof MusicUploadError ? error.status : 400);
   }
 });

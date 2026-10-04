@@ -1,4 +1,4 @@
-import { parseBuffer } from "npm:music-metadata@11.16.1";
+import { decodedDurationMs } from "./decoding.ts";
 
 export const musicTypes = {
   mp3: { contentType: "audio/mpeg", extension: "mp3", aliases: ["audio/mpeg"] },
@@ -18,25 +18,17 @@ function startsWith(bytes: Uint8Array, signature: number[], offset = 0) {
 
 function isMp3(bytes: Uint8Array) {
   if (startsWith(bytes, [0x49, 0x44, 0x33])) return true;
-  const scanLength = Math.min(bytes.length - 1, 64 * 1024);
-  for (let index = 0; index < scanLength; index++) {
-    const first = bytes[index];
-    const second = bytes[index + 1];
-    if (
-      first === 0xff && second !== undefined && (second & 0xe0) === 0xe0 &&
-      ((second >> 3) & 0x03) !== 0x01 && ((second >> 1) & 0x03) !== 0
-    ) return true;
-  }
-  return false;
+  return bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0 &&
+    ((bytes[1] >> 3) & 3) !== 1 && ((bytes[1] >> 1) & 3) === 1;
 }
 
 function sniffMusicType(bytes: Uint8Array): MusicType | null {
-  if (isMp3(bytes)) return musicTypes.mp3;
   if (startsWith(bytes, [0x4f, 0x67, 0x67, 0x53])) return musicTypes.ogg;
   if (
     startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) &&
     startsWith(bytes, [0x57, 0x41, 0x56, 0x45], 8)
   ) return musicTypes.wav;
+  if (isMp3(bytes)) return musicTypes.mp3;
   return null;
 }
 
@@ -57,26 +49,11 @@ export async function validateMusicFile(
     throw new Error("MIME type does not match the audio format");
   }
 
-  let metadata;
+  let durationMs: number;
   try {
-    metadata = await parseBuffer(
-      bytes,
-      { mimeType: type.contentType, path: fileName, size: bytes.byteLength },
-      { duration: true, skipCovers: true },
-    );
+    durationMs = await decodedDurationMs(bytes, type.extension);
   } catch {
     throw new Error("audio file is invalid or cannot be decoded");
-  }
-
-  if (
-    !Number.isFinite(metadata.format.duration) || metadata.format.duration! <= 0
-  ) {
-    throw new Error("audio duration could not be determined");
-  }
-
-  const durationMs = Math.round(metadata.format.duration! * 1000);
-  if (!Number.isSafeInteger(durationMs) || durationMs <= 0) {
-    throw new Error("audio duration could not be determined");
   }
 
   return { type, durationMs };
