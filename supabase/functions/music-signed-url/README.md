@@ -48,7 +48,8 @@ BE #45가 `public.room_jukebox_states`에 아래 최소 필드와 조회 RLS를 
 | `status`         | `playing`·`paused`·`stopped`. 기본값·빈 참조·음악 삭제 시 `stopped` |
 
 활성 룸 구성원만 상태 행을 조회한다. 클라이언트의 INSERT·UPDATE·DELETE 권한은
-부여하지 않는다. 이 단계에서 음악 선택 기능은 아직 제공하지 않는다.
+부여하지 않는다. BE #46의 음악 선택·상태 제어는
+[주크박스 제어 계약](../../tests/room_jukebox_control.md)을 따른다.
 
 BE #46은 기존 음악 참조와 `status`를 사용하고 이 테이블을 확장해 기준 위치·서버
 변경 시각·반복 여부와 Realtime을 구현한다. 로그인한 활성 마스터만 자신의 음악을
@@ -78,3 +79,11 @@ deno test --allow-env --allow-net=127.0.0.1:54321 --allow-run=docker \
 강제 퇴장은 기존 마스터 RPC로 실행한다. 두 경우 모두 퇴장 전 JWT를 다시 사용해
 새 발급 거부를 검증한다. 5분은 실제 서명 토큰의 만료 값으로 확인하고, 실제 만료
 후 다운로드 거부는 같은 Storage 발급기에 2초 TTL을 지정해 확인한다.
+
+
+BE #46 통합 검증은 관리자 상태 삽입 대신 실제 마스터의 주크박스 RPC로 음악을
+선택·변경·정지한다. 마스터·플레이어·관전자·비구성원과 퇴장 전 JWT·WebSocket을
+유지한 사용자의 상태 조회·제어·Postgres Changes INSERT/UPDATE 수신을 검증한다.
+현재 음악 삭제 시 정지 UPDATE와 URL 재발급 거부도 확인한다. 2026-10-05에
+테스트 1개·하위 단계 10개가 통과했다. 상세 범위와 결과는
+[주크박스 통합 검증](../../tests/room_jukebox_control.md#realtimestorage-통합-검증)을 따른다.
