@@ -18,6 +18,91 @@ function* chunks(bytes: Uint8Array) {
   }
 }
 
+function validateWavFormat(fmt: Uint8Array, dataSize: number) {
+  const view = new DataView(fmt.buffer, fmt.byteOffset, fmt.byteLength);
+  let codec = view.getUint16(8, true);
+  const channels = view.getUint16(10, true);
+  const rate = view.getUint32(12, true);
+  const byteRate = view.getUint32(16, true);
+  const align = view.getUint16(20, true);
+  const bits = view.getUint16(22, true);
+  let extra = 0;
+  if (fmt.length !== 24) {
+    if (fmt.length < 26) throw invalidAudio();
+    extra = view.getUint16(24, true);
+    if (fmt.length !== 26 + extra) throw invalidAudio();
+  }
+  if (!channels || !rate || !byteRate || !align || dataSize % align) {
+    throw invalidAudio();
+  }
+  if (codec === 0xfffe) {
+    if (extra < 22) throw invalidAudio();
+    // Only standard PCM/IEEE float GUIDs are supported by this decoder.
+    const guidTail = [
+      0,
+      0,
+      0,
+      0,
+      0x10,
+      0,
+      0x80,
+      0,
+      0,
+      0xaa,
+      0,
+      0x38,
+      0x9b,
+      0x71,
+    ];
+    if (!guidTail.every((byte, index) => fmt[34 + index] === byte)) {
+      throw invalidAudio();
+    }
+    codec = view.getUint16(32, true);
+    const validBits = view.getUint16(26, true);
+    if (
+      ![1, 3].includes(codec) || !validBits || validBits > bits ||
+      (codec === 3 && validBits !== bits)
+    ) throw invalidAudio();
+  }
+  if ([1, 3, 6, 7].includes(codec)) {
+    const allowedBits = codec === 1
+      ? [8, 16, 24, 32]
+      : codec === 3
+      ? [32, 64]
+      : [8];
+    // Bound decoded allocations by real sample bytes, before decoder creation.
+    if (
+      !allowedBits.includes(bits) || align !== channels * (bits / 8) ||
+      byteRate !== rate * align
+    ) throw invalidAudio();
+  } else if (codec === 0x11 || codec === 2) {
+    if (bits !== 4 || extra < 2) throw invalidAudio();
+    const headerSize = (codec === 0x11 ? 4 : 7) * channels;
+    const samples = view.getUint16(26, true);
+    const expected = (codec === 0x11 ? 1 : 2) +
+      (align - headerSize) * 2 / channels;
+    if (
+      align < headerSize || !Number.isInteger(expected) ||
+      samples !== expected ||
+      (codec === 0x11 && (align - headerSize) % (4 * channels))
+    ) {
+      throw invalidAudio();
+    }
+    const expectedRate = rate * align / samples;
+    if (
+      byteRate !== Math.floor(expectedRate) &&
+      byteRate !== Math.ceil(expectedRate)
+    ) {
+      throw invalidAudio();
+    }
+    if (codec === 2) {
+      if (extra < 4) throw invalidAudio();
+      const coefficients = view.getUint16(28, true);
+      if (!coefficients || extra !== 4 + coefficients * 4) throw invalidAudio();
+    }
+  } else throw invalidAudio();
+}
+
 // Validate declared lengths before a decoder can recover from a truncated file.
 function wavChunks(bytes: Uint8Array): Iterable<Uint8Array> {
   if (bytes.length < 12) throw invalidAudio();
@@ -42,14 +127,7 @@ function wavChunks(bytes: Uint8Array): Iterable<Uint8Array> {
     offset = next;
   }
   if (!fmt || !audio) throw invalidAudio();
-  const format = new DataView(fmt.buffer, fmt.byteOffset, fmt.byteLength);
-  const align = format.getUint16(20, true);
-  if (
-    !format.getUint16(10, true) || !format.getUint32(12, true) || !align ||
-    audio.length % align
-  ) {
-    throw invalidAudio();
-  }
+  validateWavFormat(fmt, audio.length);
   // Feed only fmt/data to the decoder; preserve the original file in Storage.
   // This also handles odd-sized metadata chunks with their RIFF padding.
   const header = new Uint8Array(12 + fmt.length + 8);

@@ -199,3 +199,164 @@ Deno.test("rejects truncated MP3 and corrupt or unfinished OGG pages", async () 
     if (!rejected) throw new Error(`${name} corruption was accepted`);
   }
 });
+
+Deno.test("rejects forged WAV format fields before allocating decoded samples", async () => {
+  const original = globalThis.Float32Array;
+  let allocated = 0;
+  globalThis.Float32Array = new Proxy(original, {
+    construct(target, args, newTarget) {
+      if (typeof args[0] === "number") allocated += args[0] * 4;
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+  try {
+    for (const [offset, value] of [[22, 128], [32, 2], [34, 4], [28, 1]]) {
+      const bytes = wavFile();
+      new DataView(bytes.buffer).setUint16(offset, value, true);
+      let rejected = false;
+      try {
+        await validateMusicFile("forged.wav", "audio/wav", bytes);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) throw new Error(`forged field ${offset} was accepted`);
+    }
+    if (allocated) {
+      throw new Error(`invalid WAV allocated ${allocated} decoded bytes`);
+    }
+  } finally {
+    globalThis.Float32Array = original;
+  }
+});
+
+function formattedWav(
+  codec: number,
+  bits: number,
+  channels: number,
+  align: number,
+  dataSize: number,
+  extra?: Uint8Array,
+) {
+  const fmtSize = extra ? 18 + extra.length : 16;
+  const dataOffset = 12 + 8 + fmtSize;
+  const bytes = new Uint8Array(dataOffset + 8 + dataSize + dataSize % 2);
+  const view = new DataView(bytes.buffer);
+  for (
+    const [offset, label] of [[0, "RIFF"], [8, "WAVE"], [12, "fmt "], [
+      dataOffset,
+      "data",
+    ]] as const
+  ) {
+    bytes.set(new TextEncoder().encode(label), offset);
+  }
+  view.setUint32(4, bytes.length - 8, true);
+  view.setUint32(16, fmtSize, true);
+  view.setUint16(20, codec, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, 8000, true);
+  const samples = (codec === 0x11 || codec === 2) && extra
+    ? new DataView(extra.buffer, extra.byteOffset, extra.byteLength).getUint16(
+      0,
+      true,
+    )
+    : 1;
+  view.setUint32(28, Math.floor(8000 * align / samples), true);
+  view.setUint16(32, align, true);
+  view.setUint16(34, bits, true);
+  if (extra) {
+    view.setUint16(36, extra.length, true);
+    bytes.set(extra, 38);
+  }
+  view.setUint32(dataOffset + 4, dataSize, true);
+  return bytes;
+}
+
+Deno.test("keeps valid stereo PCM, float, companded and extensible WAV support", async () => {
+  const extensible = new Uint8Array(22);
+  new DataView(extensible.buffer).setUint16(0, 16, true);
+  extensible.set([
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0x10,
+    0,
+    0x80,
+    0,
+    0,
+    0xaa,
+    0,
+    0x38,
+    0x9b,
+    0x71,
+  ], 6);
+  for (
+    const [codec, bits, channels, align, extra, duration] of [
+      [1, 16, 2, 4, undefined, 250],
+      [3, 32, 1, 4, undefined, 250],
+      [3, 64, 1, 8, undefined, 125],
+      [6, 8, 1, 1, undefined, 1000],
+      [7, 8, 1, 1, undefined, 1000],
+      [0xfffe, 16, 2, 4, extensible, 250],
+    ] as const
+  ) {
+    const result = await validateMusicFile(
+      "valid.wav",
+      "audio/wav",
+      formattedWav(codec, bits, channels, align, 8000, extra),
+    );
+    if (result.durationMs !== duration) {
+      throw new Error(`codec ${codec}: wrong duration`);
+    }
+  }
+});
+
+Deno.test("validates ADPCM sample counts and extensions before decoding", async () => {
+  const ima = new Uint8Array(2);
+  new DataView(ima.buffer).setUint16(0, 505, true);
+  const ms = new Uint8Array(32);
+  const msView = new DataView(ms.buffer);
+  msView.setUint16(0, 500, true);
+  msView.setUint16(2, 7, true);
+  for (
+    const [i, pair] of [[256, 0], [512, -256], [0, 0], [192, 64], [240, 0], [
+      460,
+      -208,
+    ], [392, -232]].entries()
+  ) {
+    msView.setInt16(4 + i * 4, pair[0], true);
+    msView.setInt16(6 + i * 4, pair[1], true);
+  }
+  for (const [codec, extra] of [[0x11, ima], [2, ms]] as const) {
+    const valid = formattedWav(codec, 4, 1, 256, 256, extra);
+    const result = await validateMusicFile("valid.wav", "audio/wav", valid);
+    if (result.durationMs !== 63) {
+      throw new Error(`codec ${codec}: wrong duration`);
+    }
+    const forged = valid.slice();
+    new DataView(forged.buffer).setUint16(38, 65535, true);
+    const original = globalThis.Float32Array;
+    let allocated = 0;
+    globalThis.Float32Array = new Proxy(original, {
+      construct(target, args, newTarget) {
+        if (typeof args[0] === "number") allocated += args[0] * 4;
+        return Reflect.construct(target, args, newTarget);
+      },
+    });
+    try {
+      let rejected = false;
+      try {
+        await validateMusicFile("forged.wav", "audio/wav", forged);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected || allocated) {
+        throw new Error(`forged ADPCM allocated ${allocated} bytes`);
+      }
+    } finally {
+      globalThis.Float32Array = original;
+    }
+  }
+});
