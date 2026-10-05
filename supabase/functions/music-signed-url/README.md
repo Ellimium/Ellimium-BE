@@ -48,7 +48,8 @@ BE #45가 `public.room_jukebox_states`에 아래 최소 필드와 조회 RLS를 
 | `status`         | `playing`·`paused`·`stopped`. 기본값·빈 참조·음악 삭제 시 `stopped` |
 
 활성 룸 구성원만 상태 행을 조회한다. 클라이언트의 INSERT·UPDATE·DELETE 권한은
-부여하지 않는다. 이 단계에서 음악 선택 기능은 아직 제공하지 않는다.
+부여하지 않는다. BE #46의 음악 선택·상태 제어는
+[주크박스 제어 계약](../../tests/room_jukebox_control.md)을 따른다.
 
 BE #46은 기존 음악 참조와 `status`를 사용하고 이 테이블을 확장해 기준 위치·서버
 변경 시각·반복 여부와 Realtime을 구현한다. 로그인한 활성 마스터만 자신의 음악을

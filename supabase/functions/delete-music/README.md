@@ -53,8 +53,8 @@ BE #45가 `room_jukebox_states.status`에 `playing`·`paused`·`stopped` 값을
 잠금으로 조정한다. 클라이언트의 상태 테이블 직접 변경 권한은 계속 차단한다.
 
 BE #46은 기존 `room_id`, `music_asset_id`, `status`를 사용해 기준 위치·서버
-시각· 반복 필드와 마스터 전용 상태 변경 함수 및 Realtime을 구현한다. 이번
-작업에는 주크박스 재생·동기화 구현을 포함하지 않는다.
+시각·반복 필드와 마스터 전용 상태 변경 함수 및 Realtime을 추가한다.
+구현된 RPC와 삭제 후 위치·반복 초기화는 [주크박스 제어 계약](../../tests/room_jukebox_control.md)을 따른다.
 
 BE #46의 상태 변경 함수는 선택할 음악 행의 `FOR KEY SHARE` 잠금을 먼저 얻은 뒤
 주크박스 행을 변경해야 한다. 삭제 준비도 음악 행을 먼저 잠그므로 같은 순서를
