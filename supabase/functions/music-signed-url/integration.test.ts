@@ -1,4 +1,8 @@
-import { createClient } from "npm:@supabase/supabase-js@2.117.2";
+// deno-lint-ignore-file no-import-prefix
+import {
+  createClient,
+  type RealtimeChannel,
+} from "npm:@supabase/supabase-js@2.117.2";
 
 const url = Deno.env.get("SUPABASE_URL");
 const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
@@ -15,11 +19,76 @@ function client(key: string) {
   });
 }
 
-Deno.test("music signed URL authorization, revocation and expiration", async (test) => {
+Deno.test("jukebox RPC, Realtime and signed URL authorization, revocation and expiration", async (test) => {
   const admin = client(serviceKey!);
   const users: { id: string; token: string; api: ReturnType<typeof client> }[] =
     [];
   const paths: string[] = [];
+  const events = new Map<
+    string,
+    { eventType: string; new: Record<string, unknown> }[]
+  >();
+  async function subscribe(channel: RealtimeChannel) {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Realtime subscription timed out")),
+        10_000,
+      );
+      channel.subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          clearTimeout(timer);
+          resolve();
+        } else if (["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"].includes(status)) {
+          clearTimeout(timer);
+          reject(new Error(`Realtime subscription failed: ${status}`));
+        }
+      });
+    });
+  }
+  async function expectEvent(
+    state: Record<string, unknown>,
+    allowed: typeof users,
+    denied: typeof users,
+    eventType = "UPDATE",
+  ) {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (
+        allowed.every((user) =>
+          events.get(user.id)!.some((event) =>
+            event.eventType === eventType &&
+            event.new.state_changed_at === state.state_changed_at &&
+            event.new.music_asset_id === state.music_asset_id &&
+            event.new.status === state.status &&
+            event.new.position_ms === state.position_ms &&
+            event.new.loop_enabled === state.loop_enabled
+          )
+        )
+      ) break;
+      if (attempt === 99) {
+        throw new Error(
+          `authorized member did not receive ${eventType}: ${
+            JSON.stringify(allowed.map((user) =>
+              events.get(user.id)!.map((event) => ({
+                eventType: event.eventType,
+                state: event.new,
+              }))
+            ))
+          }`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    // Wait after positive delivery to detect unauthorized asynchronous delivery.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    for (const user of denied) {
+      assert(
+        !events.get(user.id)!.some((event) =>
+          event.new.state_changed_at === state.state_changed_at
+        ),
+        "unauthorized member received jukebox change",
+      );
+    }
+  }
   let roomId: string | undefined;
   let failure: unknown;
   const cleanupErrors: unknown[] = [];
@@ -82,6 +151,7 @@ Deno.test("music signed URL authorization, revocation and expiration", async (te
       if (login.error) throw login.error;
       assert(login.data.session, "test login failed");
       users[users.length - 1].token = login.data.session.access_token;
+      await api.realtime.setAuth(login.data.session.access_token);
     }
     const [owner, player, spectator, left, removed, outsider] = users;
     const created = await owner.api.rpc("create_room", {
@@ -126,11 +196,76 @@ Deno.test("music signed URL authorization, revocation and expiration", async (te
       paths.push(uploaded.musicAsset.storage_path);
       assets.push(uploaded.musicAsset.id);
     }
-    const referenced = await admin.from("room_jukebox_states").insert({
-      room_id: roomId,
-      music_asset_id: assets[0],
+    for (const user of users) {
+      events.set(user.id, []);
+      const channel = user.api.channel(`jukebox-${user.id}-${roomId}`).on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "room_jukebox_states",
+          filter: `room_id=eq.${roomId}`,
+        },
+        (payload) =>
+          events.get(user.id)!.push({
+            eventType: payload.eventType,
+            new: payload.new,
+          }),
+      );
+      await subscribe(channel);
+    }
+    const control = async (
+      action: string,
+      extra: Record<string, unknown> = {},
+    ) => {
+      const result = await owner.api.rpc("control_room_jukebox", {
+        target_room_id: roomId,
+        action,
+        ...extra,
+      });
+      if (result.error) throw result.error;
+      const state = Array.isArray(result.data) ? result.data[0] : result.data;
+      assert(state?.room_id === roomId, "control returned no state");
+      return state as Record<string, unknown>;
+    };
+    await test.step("master initializes state and only active members receive INSERT", async () => {
+      const state = await control("play", { target_music_asset_id: assets[0] });
+      await expectEvent(state, [owner, player, spectator, left, removed], [
+        outsider,
+      ], "INSERT");
     });
-    if (referenced.error) throw referenced.error;
+    await test.step("role-based DB access, RPC control and state UPDATE over WebSockets", async () => {
+      for (const user of users) {
+        const read = await user.api.from("room_jukebox_states").select("*").eq(
+          "room_id",
+          roomId!,
+        );
+        assert(
+          !read.error && read.data.length === (user === outsider ? 0 : 1),
+          "unexpected role-based state visibility",
+        );
+        if (user !== owner) {
+          const denied = await user.api.rpc("control_room_jukebox", {
+            target_room_id: roomId,
+            action: "stop",
+          });
+          assert(
+            denied.error?.code === "42501",
+            "non-master control was not denied",
+          );
+        }
+      }
+      const direct = await owner.api.from("room_jukebox_states").update({
+        status: "paused",
+      }).eq("room_id", roomId!);
+      assert(direct.error?.code === "42501", "master bypassed checked RPC");
+      for (const action of ["pause", "resume"]) {
+        const state = await control(action);
+        await expectEvent(state, [owner, player, spectator, left, removed], [
+          outsider,
+        ]);
+      }
+    });
 
     await test.step("CORS, method, authentication and input validation", async () => {
       const preflight = await fetch(`${url}/functions/v1/music-signed-url`, {
@@ -232,6 +367,30 @@ Deno.test("music signed URL authorization, revocation and expiration", async (te
         target_user_id: removed.id,
       });
       if (kicked.error) throw kicked.error;
+      for (const user of [left, removed]) {
+        const read = await user.api.from("room_jukebox_states").select("*").eq(
+          "room_id",
+          roomId!,
+        );
+        assert(
+          !read.error && read.data.length === 0,
+          "departed member can read state with old JWT",
+        );
+        const denied = await user.api.rpc("control_room_jukebox", {
+          target_room_id: roomId,
+          action: "stop",
+        });
+        assert(
+          denied.error?.code === "42501",
+          "departed member can control state with old JWT",
+        );
+      }
+      const state = await control("seek", { target_position_ms: 50 });
+      await expectEvent(state, [owner, player, spectator], [
+        left,
+        removed,
+        outsider,
+      ]);
       await issue(left.token, { musicAssetId: assets[0] }, 403);
       await issue(removed.token, { musicAssetId: assets[0] }, 403);
       await download(issuedLeft.signedUrl, true);
@@ -239,22 +398,101 @@ Deno.test("music signed URL authorization, revocation and expiration", async (te
       const direct = await left.api.storage.from("music-assets")
         .createSignedUrl(paths[0], 300);
       assert(direct.error, "direct Storage API must also enforce departure");
+      const removedDirect = await removed.api.storage.from("music-assets")
+        .createSignedUrl(paths[0], 300);
+      assert(
+        removedDirect.error,
+        "direct Storage API must also enforce removal",
+      );
     });
     await test.step("reference replacement and clearing recheck access", async () => {
       const old = await issue(player.token, { musicAssetId: assets[0] }, 200);
-      const changed = await admin.from("room_jukebox_states").update({
-        music_asset_id: assets[1],
-      }).eq("room_id", roomId!);
-      if (changed.error) throw changed.error;
+      const changed = await control("play", {
+        target_music_asset_id: assets[1],
+        target_loop_enabled: true,
+      });
+      await expectEvent(changed, [owner, player, spectator], [
+        left,
+        removed,
+        outsider,
+      ]);
       await issue(player.token, { musicAssetId: assets[0] }, 403);
       await issue(player.token, { musicAssetId: assets[1] }, 200);
       await download(old.signedUrl, true);
-      const cleared = await admin.from("room_jukebox_states").update({
-        music_asset_id: null,
-      }).eq("room_id", roomId!);
-      if (cleared.error) throw cleared.error;
+      const cleared = await control("stop");
+      await expectEvent(cleared, [owner, player, spectator], [
+        left,
+        removed,
+        outsider,
+      ]);
+      assert(
+        cleared.music_asset_id === null && cleared.position_ms === 0 &&
+          cleared.loop_enabled === false,
+        "stop did not clear playback fields",
+      );
       await issue(player.token, { musicAssetId: assets[1] }, 403);
       await issue(owner.token, { musicAssetId: assets[0] }, 200);
+    });
+    await test.step("current music deletion sends a stopped UPDATE and denies URL renewal", async () => {
+      await control("play", {
+        target_music_asset_id: assets[1],
+        target_position_ms: 100,
+        target_loop_enabled: true,
+      });
+      const response = await fetch(`${url}/functions/v1/delete-music`, {
+        method: "POST",
+        headers: {
+          apikey: anonKey!,
+          Authorization: `Bearer ${owner.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ musicAssetId: assets[1] }),
+      });
+      await response.json();
+      assert(response.ok, "current music deletion failed");
+      const read = await owner.api.from("room_jukebox_states").select("*").eq(
+        "room_id",
+        roomId!,
+      ).single();
+      if (read.error) throw read.error;
+      assert(
+        read.data.status === "stopped" && read.data.music_asset_id === null &&
+          read.data.position_ms === 0 && !read.data.loop_enabled,
+        "deletion did not preserve and clear the state row",
+      );
+      await expectEvent(read.data, [owner, player, spectator], [
+        left,
+        removed,
+        outsider,
+      ]);
+      assert(
+        [...events.values()].every((received) =>
+          received.every((event) => event.eventType !== "DELETE")
+        ),
+        "music deletion must not delete the state row",
+      );
+      await issue(player.token, { musicAssetId: assets[1] }, 403);
+      await issue(owner.token, { musicAssetId: assets[1] }, 403);
+    });
+    await test.step("departed member's previously issued Storage token expires", async () => {
+      const state = await control("play", { target_music_asset_id: assets[0] });
+      await expectEvent(state, [owner, player, spectator], [
+        left,
+        removed,
+        outsider,
+      ]);
+      const short = await player.api.storage.from("music-assets")
+        .createSignedUrl(paths[0], 2);
+      if (short.error) throw short.error;
+      const kicked = await owner.api.rpc("force_remove_room_member", {
+        target_room_id: roomId,
+        target_user_id: player.id,
+      });
+      if (kicked.error) throw kicked.error;
+      await issue(player.token, { musicAssetId: assets[0] }, 403);
+      await download(short.data.signedUrl, true);
+      await new Promise((resolve) => setTimeout(resolve, 3100));
+      await download(short.data.signedUrl, false);
     });
     await test.step("Storage signed token expires even without membership changes", async () => {
       // Exercise the same Storage issuer with a short TTL instead of waiting 5 minutes.
@@ -268,6 +506,14 @@ Deno.test("music signed URL authorization, revocation and expiration", async (te
   } catch (error) {
     failure = error;
   } finally {
+    for (const user of users) {
+      try {
+        await user.api.removeAllChannels();
+        user.api.realtime.disconnect();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     if (roomId) {
       const deleted = await admin.from("rooms").delete().eq("id", roomId);
       if (deleted.error) cleanupErrors.push(deleted.error);

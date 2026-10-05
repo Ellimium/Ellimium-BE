@@ -89,5 +89,53 @@ npx supabase db advisors --local --type security --level warn
 - DB lint와 security advisors: 발견된 문제 없음.
 - 별도 로컬 DB 세션에서 재생 제어 먼저/삭제 준비 먼저의 두 동시 실행 순서를 확인했다. 교착 없이 삭제 후 정지 또는 재선택 거부를 확인하고 임시 데이터를 정리했다.
 
-역할별 실제 Realtime 수신과 signed URL 발급·만료 통합 검증은 두 번째 TODO에서
-수행한다. 현재 검증은 DB 권한·publication 설정·SQL 동작 범위다.
+## Realtime·Storage 통합 검증
+
+`supabase/functions/music-signed-url/integration.test.ts`에서 실제 사용자 JWT로
+주크박스 RPC를 호출하고 Postgres Changes WebSocket·Edge Functions·Storage를
+함께 검증한다. fixture 음악 등록은 `upload-music`, 재생 제어는 마스터 RPC,
+음악 삭제는 `delete-music`을 사용한다. 상태 행을 관리자 권한으로 만들어
+주크박스 제어를 우회하지 않는다.
+
+| 사용자 | 상태 조회 | 공용 제어 | INSERT·UPDATE 수신 | 현재 음악 새 URL |
+| --- | --- | --- | --- | --- |
+| 활성 마스터·음악 소유자 | 허용 | 허용 (직접 쓰기는 거부) | 허용 | 허용 |
+| 활성 플레이어·관전자 | 허용 | 거부 | 허용 | 허용 |
+| 퇴장·강제 퇴장 구성원 | 거부 | 거부 | 거부 | 거부 |
+| 비구성원 | 거부 | 거부 | 거부 | 거부 |
+
+퇴장·강제 퇴장 검증에서는 로그인 시 받은 JWT와 이미 열린 WebSocket 구독을
+그대로 유지한다. 구성원 상태가 변경되면 후속 UPDATE가 전달되지 않으며 DB
+조회와 signed URL 재발급·직접 Storage 발급도 거부된다. 음악 소유자는 별도의
+소유권 정책으로 참조되지 않은 개인 음악에도 접근할 수 있다. 룸 읽기 권한이
+음악 소유자의 라이브러리 메타데이터 조회 권한으로 확장되지 않는 것도 확인한다.
+
+Endpoint의 TTL은 실제 서명 토큰의 `exp - iat = 300`으로 확인한다. 이미 발급된
+URL은 퇴장·강제 퇴장·음악 변경 후에도 다운로드할 수 있다. 같은 Storage 발급기로
+2초짜리 URL을 발급한 뒤 퇴장시켜 만료 전 다운로드와 만료 후 거부도 확인한다.
+이 테스트가 endpoint URL의 5분을 실제로 기다리는 것은 아니다. 음악 삭제 시
+파일은 제거되므로 URL 자체가 만료하지 않았더라도 다운로드할 수 없을 수 있다.
+
+구독 성공 직후 로컬 복제 worker 준비가 완료되지 않을 수 있어, 기존 Postgres
+Changes 테스트와 같이 초기 구독 후 3초 대기한다. 첫 INSERT 및 각 UPDATE의
+전체 상태 필드가 활성 구성원에게 도착하는지 기다린 뒤 비구성원·퇴장 사용자의
+미수신을 추가 확인한다. 음악 삭제는 참조·위치·반복을 초기화하는 UPDATE이며
+상태 행 DELETE가 발생하지 않는 것을 검증한다.
+
+로컬 CLI 상태에서 `SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+`SUPABASE_SERVICE_ROLE_KEY`를 프로세스 환경으로만 전달하고, 키를 파일·로그에
+기록하지 않는다. 테스트는 로컬 URL만 허용하며 임시 사용자·룸·음악 파일과
+WebSocket 구독을 종료 시 정리한다.
+
+```sh
+npx supabase functions serve
+# 다른 터미널에서 로컬 테스트 환경 변수를 전달한 뒤 실행
+deno test --allow-env --allow-net=127.0.0.1:54321 --allow-run=docker \
+  --allow-read=supabase/functions/upload-music/testdata \
+  --node-modules-dir=auto --lock=supabase/functions/music-signed-url/deno.lock \
+  supabase/functions/music-signed-url/integration.test.ts
+```
+
+2026-10-05 로컬 통합 검증: 테스트 1개·하위 단계 10개 통과. Deno 타입 검사·lint·
+포맷 검사도 통과했다. 자진 퇴장 RPC가 없어 `left` 상태만 로컬 postgres로
+설정하고, 강제 퇴장은 마스터 RPC로 실행했다.
