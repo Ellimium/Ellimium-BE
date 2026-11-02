@@ -2,7 +2,6 @@
 import {
   createClient,
   type RealtimeChannel,
-  type SupabaseClient,
 } from "npm:@supabase/supabase-js@2.117.2";
 
 const url = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
@@ -62,47 +61,86 @@ async function waitFor(condition: () => boolean, message: string) {
   throw new Error(message);
 }
 
-Deno.test("drawing CRUD reaches another active member over private Broadcast", async () => {
-  const master = await register("drawing-master");
-  const player = await register("drawing-player");
-  const outsider = await register("drawing-outsider");
-  const admin = client(serviceRoleKey!);
-  const clients: SupabaseClient[] = [
-    master.supabase,
-    player.supabase,
-    outsider.supabase,
-    admin,
-  ];
+type DrawingRow = {
+  id: string;
+  geometry: { x: number; y: number };
+  text_content: string;
+};
 
+type DrawingEvent = {
+  event: string;
+  payload: { record: DrawingRow; old_record: DrawingRow };
+};
+
+Deno.test("drawing Broadcast respects map_view on new private subscriptions", async () => {
+  const admin = client(serviceRoleKey!);
+  let roomId: string | undefined;
+  const users: Awaited<ReturnType<typeof register>>[] = [];
+  async function user(label: string) {
+    const registered = await register(label);
+    users.push(registered);
+    return registered;
+  }
   try {
-    const { data: created, error: createError } = await master.supabase.rpc(
-      "create_room",
-      {
-        room_name: "Realtime drawing test",
-        room_description: null,
-        room_game_system: "test",
-      },
-    );
-    if (createError) throw createError;
+    const master = await user("drawing-master");
+    const outsider = await user("drawing-outsider");
+    const removed = await user("drawing-removed");
+    const { data: created, error } = await master.supabase.rpc("create_room", {
+      room_name: "Realtime drawing test",
+      room_description: null,
+      room_game_system: "test",
+    });
+    if (error) throw error;
     const room = Array.isArray(created) ? created[0] : created;
     assert(room?.id && room?.invite_code, "room creation returned no room");
 
-    const { error: joinError } = await player.supabase.rpc("join_room", {
-      room_invite_code: room.invite_code,
-    });
-    if (joinError) throw joinError;
-
-    const { error: permissionError } = await master.supabase.rpc(
-      "set_room_feature_permission",
-      {
+    roomId = room.id;
+    const rpc = async (name: string, args: Record<string, unknown>) => {
+      const { error } = await master.supabase.rpc(name, args);
+      if (error) throw error;
+    };
+    const join = async (member: typeof master) => {
+      const { error } = await member.supabase.rpc("join_room", {
+        room_invite_code: room.invite_code,
+      });
+      if (error) throw error;
+    };
+    const members = [];
+    for (const role of ["player", "spectator"]) {
+      for (const override of [null, true, false]) {
+        const member = await user(`${role}-${override}`);
+        await join(member);
+        if (role === "spectator") {
+          await rpc("set_room_member_role", {
+            target_room_id: room.id,
+            target_user_id: member.userId,
+            target_role: role,
+          });
+        }
+        if (override !== null) {
+          await rpc("set_room_feature_permission", {
+            target_room_id: room.id,
+            target_feature: "map_view",
+            new_allowed: override,
+            target_role: null,
+            target_user_id: member.userId,
+          });
+        }
+        members.push({ ...member, role, override });
+      }
+      await rpc("set_room_feature_permission", {
         target_room_id: room.id,
         target_feature: "drawing",
-        new_allowed: true,
-        target_role: "player",
+        new_allowed: false,
+        target_role: role,
         target_user_id: null,
-      },
-    );
-    if (permissionError) throw permissionError;
+      });
+    }
+    await join(removed);
+    await rpc("force_remove_room_member", {
+      target_room_id: room.id,
+      target_user_id: removed.userId,
+    });
 
     const assetId = crypto.randomUUID();
     const mapId = crypto.randomUUID();
@@ -120,97 +158,137 @@ Deno.test("drawing CRUD reaches another active member over private Broadcast", a
     });
     if (mapError) throw mapError;
 
-    const received: string[] = [];
-    const topic = `room:${room.id}:drawings`;
-    const playerChannel = player.supabase
-      .channel(topic, { config: { private: true } })
-      .on("broadcast", { event: "INSERT" }, () => received.push("INSERT"))
-      .on("broadcast", { event: "UPDATE" }, () => received.push("UPDATE"))
-      .on("broadcast", { event: "DELETE" }, () => received.push("DELETE"));
+    for (const roleAllowed of [true, false]) {
+      for (const role of ["player", "spectator"]) {
+        await rpc("set_room_feature_permission", {
+          target_room_id: room.id,
+          target_feature: "map_view",
+          new_allowed: roleAllowed,
+          target_role: role,
+          target_user_id: null,
+        });
+      }
+      const receivers = [
+        { ...master, label: "master", allowed: true },
+        ...members.map((member) => ({
+          ...member,
+          label: `${member.role}/${member.override}/role=${roleAllowed}`,
+          allowed: member.override ?? roleAllowed,
+        })),
+        { ...outsider, label: "outsider", allowed: false },
+        { ...removed, label: "removed", allowed: false },
+      ].map((receiver) => ({ ...receiver, events: [] as DrawingEvent[] }));
 
-    const playerStatus = await subscribe(playerChannel);
-    assert(
-      playerStatus === "SUBSCRIBED",
-      `active player was not subscribed: ${playerStatus}`,
-    );
-
-    const outsiderChannel = outsider.supabase.channel(topic, {
-      config: { private: true },
-    });
-    const outsiderStatus = await subscribe(outsiderChannel);
-    assert(
-      outsiderStatus.startsWith("CHANNEL_ERROR"),
-      `outsider subscribed to drawing channel: ${outsiderStatus}`,
-    );
-
-    const { data: drawing, error: insertError } = await master.supabase
-      .from("room_map_drawings")
-      .insert({
+      for (const receiver of receivers) {
+        const channel = receiver.supabase
+          .channel(`room:${room.id}:drawings`, { config: { private: true } })
+          .on("broadcast", { event: "*" }, (event) => {
+            receiver.events.push({
+              event: event.event,
+              payload: event.payload,
+            });
+          });
+        const status = await subscribe(channel);
+        assert(
+          receiver.allowed
+            ? status === "SUBSCRIBED"
+            : status.startsWith("CHANNEL_ERROR") &&
+              /permission|authoriz/i.test(status),
+          `${receiver.label}: unexpected subscription result ${status}`,
+        );
+      }
+      const id = crypto.randomUUID();
+      const before = { x: 12, y: 34 };
+      const after = { x: 56, y: 78 };
+      const checkEvents = async (event: string, count: number) => {
+        await waitFor(
+          () =>
+            receivers.filter((r) => r.allowed).every((r) =>
+              r.events.length === count
+            ),
+          `${event}: allowed receivers missed Broadcast`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        for (const receiver of receivers) {
+          assert(
+            receiver.events.length === (receiver.allowed ? count : 0),
+            `${receiver.label}: unexpected ${event} event count ${receiver.events.length}`,
+          );
+          const { data: rows, error: readError } = await receiver.supabase
+            .from("room_map_drawings").select("id, geometry, text_content").eq(
+              "id",
+              id,
+            );
+          if (readError) throw readError;
+          assert(
+            rows.length === (receiver.allowed && event !== "DELETE" ? 1 : 0),
+            `${receiver.label}: unexpected drawing DB visibility after ${event}`,
+          );
+          if (!receiver.allowed) continue;
+          const message = receiver.events[count - 1];
+          assert(message.event === event, `${receiver.label}: wrong event`);
+          const row = event === "DELETE"
+            ? message.payload.old_record
+            : message.payload.record;
+          const geometry = event === "INSERT" ? before : after;
+          assert(
+            row.id === id && row.geometry.x === geometry.x &&
+              row.geometry.y === geometry.y &&
+              row.text_content ===
+                (event === "INSERT" ? "private text" : "updated private text"),
+            `${receiver.label}: incorrect ${event} payload`,
+          );
+          if (event === "UPDATE") {
+            const old = message.payload.old_record;
+            assert(
+              old.id === id && old.geometry.x === before.x &&
+                old.geometry.y === before.y &&
+                old.text_content === "private text",
+              `${receiver.label}: incorrect previous row`,
+            );
+          }
+        }
+      };
+      const { error: insertError } = await master.supabase.from(
+        "room_map_drawings",
+      ).insert({
+        id,
         map_id: mapId,
-        drawing_type: "freehand",
-        geometry: { points: [{ x: 1, y: 1 }, { x: 10, y: 10 }] },
+        drawing_type: "text",
+        geometry: before,
+        text_content: "private text",
         color: "#123456",
         stroke_width: 4,
-      })
-      .select("id")
-      .single();
-    if (insertError) throw insertError;
-    await waitFor(
-      () => received.length === 1,
-      `INSERT Broadcast was not received: ${JSON.stringify(received)}`,
-    );
-    const { data: inserted, error: readError } = await player.supabase
-      .from("room_map_drawings")
-      .select("color, stroke_width")
-      .eq("id", drawing.id)
-      .single();
-    if (readError) throw readError;
-    assert(
-      inserted.color === "#123456",
-      "player did not read inserted drawing",
-    );
-
-    const { error: updateError } = await master.supabase
-      .from("room_map_drawings")
-      .update({ color: "#ABCDEF", stroke_width: 7 })
-      .eq("id", drawing.id);
-    if (updateError) throw updateError;
-    await waitFor(
-      () => received.length === 2,
-      `UPDATE Broadcast was not received: ${JSON.stringify(received)}`,
-    );
-    const { data: updated, error: updatedReadError } = await player.supabase
-      .from("room_map_drawings")
-      .select("color, stroke_width")
-      .eq("id", drawing.id)
-      .single();
-    if (updatedReadError) throw updatedReadError;
-    assert(
-      updated.color === "#ABCDEF" && updated.stroke_width === 7,
-      "player did not read updated drawing",
-    );
-
-    const { error: deleteError } = await master.supabase
-      .from("room_map_drawings")
-      .delete()
-      .eq("id", drawing.id);
-    if (deleteError) throw deleteError;
-    await waitFor(
-      () => received.length === 3,
-      `DELETE Broadcast was not received: ${JSON.stringify(received)}`,
-    );
-    const { data: deleted, error: deletedReadError } = await player.supabase
-      .from("room_map_drawings")
-      .select("id")
-      .eq("id", drawing.id);
-    if (deletedReadError) throw deletedReadError;
-    assert(deleted.length === 0, "player still read deleted drawing");
-    assert(
-      received.join(",") === "INSERT,UPDATE,DELETE",
-      `unexpected Broadcast order: ${JSON.stringify(received)}`,
-    );
+      });
+      if (insertError) throw insertError;
+      await checkEvents("INSERT", 1);
+      const { error: updateError } = await master.supabase.from(
+        "room_map_drawings",
+      )
+        .update({ geometry: after, text_content: "updated private text" }).eq(
+          "id",
+          id,
+        );
+      if (updateError) throw updateError;
+      await checkEvents("UPDATE", 2);
+      const { error: deleteError } = await master.supabase.from(
+        "room_map_drawings",
+      ).delete().eq("id", id);
+      if (deleteError) throw deleteError;
+      await checkEvents("DELETE", 3);
+      await Promise.all(users.map((u) => u.supabase.removeAllChannels()));
+    }
   } finally {
-    await Promise.all(clients.map((supabase) => supabase.removeAllChannels()));
-    await Promise.all(clients.map((supabase) => supabase.auth.signOut()));
+    await Promise.all(users.map((u) => u.supabase.removeAllChannels()));
+    await Promise.all(users.map((u) => u.supabase.auth.signOut()));
+    if (roomId) {
+      const { error } = await admin.from("rooms").delete().eq("id", roomId);
+      assert(!error, `failed to clean up test room: ${error?.message}`);
+    }
+    for (const u of users) {
+      const { error } = await admin.auth.admin.deleteUser(u.userId);
+      assert(!error, `failed to clean up test user: ${error?.message}`);
+    }
+    await admin.removeAllChannels();
   }
 });
