@@ -1,6 +1,6 @@
 begin;
 
-select plan(23);
+select plan(37);
 
 select has_table('public', 'room_tokens', 'room tokens table exists');
 select col_is_pk('public', 'room_tokens', 'id', 'room token id is the primary key');
@@ -41,7 +41,8 @@ set local role postgres;
 insert into public.room_members (room_id, user_id, role) values
   ((select id from test_room), '00000000-0000-0000-0000-000000000081', 'player'),
   ((select id from test_room), '00000000-0000-0000-0000-000000000082', 'spectator'),
-  ((select id from other_room), '00000000-0000-0000-0000-000000000083', 'player');
+  ((select id from other_room), '00000000-0000-0000-0000-000000000083', 'player'),
+  ((select id from other_room), '00000000-0000-0000-0000-000000000081', 'player');
 
 insert into public.assets (id, owner_id, category, storage_path) values
   ('00000000-0000-0000-0000-000000000090', '00000000-0000-0000-0000-000000000080', 'map', '00000000-0000-0000-0000-000000000080/map.png'),
@@ -163,6 +164,97 @@ select results_eq(
 
 select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000080', true);
 select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000080","is_anonymous":false}', true);
+
+-- Both maps must be otherwise valid destinations, so RLS cannot mask the regression.
+set local role postgres;
+insert into public.assets (id, owner_id, category, storage_path) values
+  ('00000000-0000-0000-0000-000000000093', '00000000-0000-0000-0000-000000000080', 'map', '00000000-0000-0000-0000-000000000080/map-2.png');
+insert into public.room_maps (id, room_id, asset_id) values
+  ('00000000-0000-0000-0000-0000000000b1', (select id from test_room), '00000000-0000-0000-0000-000000000093'),
+  ('00000000-0000-0000-0000-0000000000b2', (select id from other_room), '00000000-0000-0000-0000-000000000090');
+
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000081', true);
+select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000081","is_anonymous":false}', true);
+
+select ok(
+  public.can_use_room_feature((select id from test_room), 'map_view')
+  and public.can_use_room_feature((select id from test_room), 'token_move')
+  and public.can_use_room_feature((select id from other_room), 'map_view')
+  and public.can_use_room_feature((select id from other_room), 'token_move'),
+  'player has map and token permissions in both rooms'
+);
+select throws_ok(
+  $$update public.room_tokens set map_id = '00000000-0000-0000-0000-0000000000b1' where id = '00000000-0000-0000-0000-0000000000a0'$$,
+  '23514', 'room token map cannot be changed',
+  'players cannot move an assigned token to another map in the same room'
+);
+select throws_ok(
+  $$update public.room_tokens set map_id = '00000000-0000-0000-0000-0000000000b2' where id = '00000000-0000-0000-0000-0000000000a0'$$,
+  '23514', 'room token map cannot be changed',
+  'players cannot move an assigned token to another room'
+);
+select results_eq(
+  $$select map_id, owner_id, image_asset_id from public.room_tokens where id = '00000000-0000-0000-0000-0000000000a0'$$,
+  $$values ('00000000-0000-0000-0000-0000000000b0'::uuid, '00000000-0000-0000-0000-000000000081'::uuid, '00000000-0000-0000-0000-000000000091'::uuid)$$,
+  'failed map changes preserve the original map, owner and image'
+);
+select results_eq(
+  $$update public.room_tokens set map_id = '00000000-0000-0000-0000-0000000000b0', x = 7, y = 8 where id = '00000000-0000-0000-0000-0000000000a0' returning x, y$$,
+  $$values (7::numeric, 8::numeric)$$,
+  'players can move their token with an explicitly unchanged map'
+);
+
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000083', true);
+select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000083","is_anonymous":false}', true);
+select results_eq(
+  $$select count(*) from public.room_tokens where id = '00000000-0000-0000-0000-0000000000a0'$$,
+  $$values (0::bigint)$$,
+  'the token does not appear for target-room-only members'
+);
+select results_eq(
+  $$select count(*) from public.assets where id = '00000000-0000-0000-0000-000000000091'$$,
+  $$values (0::bigint)$$,
+  'target-room-only members still cannot read the token image metadata'
+);
+select results_eq(
+  $$select count(*) from storage.objects where bucket_id = 'assets' and name = '00000000-0000-0000-0000-000000000080/token.png'$$,
+  $$values (0::bigint)$$,
+  'target-room-only members still cannot read the token image file'
+);
+
+select set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000080', true);
+select set_config('request.jwt.claims', '{"sub":"00000000-0000-0000-0000-000000000080","is_anonymous":false}', true);
+select throws_ok(
+  $$update public.room_tokens set map_id = '00000000-0000-0000-0000-0000000000b1' where id = '00000000-0000-0000-0000-0000000000a0'$$,
+  '23514', 'room token map cannot be changed',
+  'masters cannot move an existing token to another map in the same room'
+);
+select throws_ok(
+  $$update public.room_tokens set map_id = '00000000-0000-0000-0000-0000000000b2' where id = '00000000-0000-0000-0000-0000000000a0'$$,
+  '23514', 'room token map cannot be changed',
+  'masters cannot move an existing token to another room'
+);
+select results_eq(
+  $$update public.room_tokens set x = 9, y = 10 where id = '00000000-0000-0000-0000-0000000000a0' returning x, y$$,
+  $$values (9::numeric, 10::numeric)$$,
+  'masters can move an existing token without specifying its map'
+);
+select results_eq(
+  $$update public.room_tokens set map_id = '00000000-0000-0000-0000-0000000000b0', x = 11, y = 12 where id = '00000000-0000-0000-0000-0000000000a0' returning x, y$$,
+  $$values (11::numeric, 12::numeric)$$,
+  'masters can move an existing token with an explicitly unchanged map'
+);
+select results_eq(
+  $$update public.room_tokens set owner_id = null where id = '00000000-0000-0000-0000-0000000000a0' returning owner_id$$,
+  $$values (null::uuid)$$,
+  'masters can unassign an existing token'
+);
+select results_eq(
+  $$update public.room_tokens set owner_id = '00000000-0000-0000-0000-000000000081' where id = '00000000-0000-0000-0000-0000000000a0' returning owner_id$$,
+  $$values ('00000000-0000-0000-0000-000000000081'::uuid)$$,
+  'masters can reassign an existing token'
+);
 
 select lives_ok(
   $$select public.set_room_member_role((select id from test_room), '00000000-0000-0000-0000-000000000081', 'spectator')$$,
