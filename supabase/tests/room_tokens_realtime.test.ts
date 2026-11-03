@@ -48,7 +48,13 @@ async function waitFor(condition: () => boolean) {
   throw new Error("verified Broadcast was not received");
 }
 
-type Movement = { token_id: string; x: number; y: number; sender_id: string };
+type Movement = {
+  token_id: string;
+  x: number;
+  y: number;
+  sender_id: string;
+  sent_at: string;
+};
 
 Deno.test("token movement validates every RPC and rejects direct Broadcast over real WebSockets", async () => {
   const admin = client(serviceKey!);
@@ -271,7 +277,7 @@ Deno.test("token movement validates every RPC and rejects direct Broadcast over 
         receivers.every((r) => {
           const m = r.events[count - 1];
           return m.token_id === tokenId && m.x === 10 && m.y === 20 &&
-            m.sender_id === who.id;
+            m.sender_id === who.id && Number.isFinite(Date.parse(m.sent_at));
         }),
         "incorrect server movement payload",
       );

@@ -28,10 +28,11 @@ UUID·숫자 형식 자체가 잘못된 요청은 PostgreSQL/PostgREST의 입력
 네트워크 오류와 위 오류를 포함해 FE는 `error`를 처리해야 한다.
 
 수신 채널은 **`room:<roomId>:token-movements`**, `private: true`, 이벤트는
-`token-move`다. payload는 다음 형태다. `sender_id`는 서버가 `auth.uid()`로 채운다.
+`token-move`다. payload는 다음 형태다. `sender_id`는 서버가 `auth.uid()`로, `sent_at`은 서버의 `clock_timestamp()`로 채운다.
+`sent_at`은 타임존을 포함한 ISO 시각 문자열이며 마이크로초 정밀도를 유지한다.
 
 ```ts
-{ token_id: string, x: number, y: number, sender_id: string }
+{ token_id: string, x: number, y: number, sender_id: string, sent_at: string }
 ```
 
 서버 송신은 발신 클라이언트의 채널 `broadcast.self: false`와 무관하게 발신자에게도
@@ -39,7 +40,9 @@ UUID·숫자 형식 자체가 잘못된 요청은 PostgreSQL/PostgREST의 입력
 RPC는 임시 좌표를 방송할 뿐 `room_tokens.x/y`를 저장하지 않는다. 확정 저장은
 기존 RLS로 보호된 UPDATE를 사용한다. RPC 성공은 연결된 모든 화면에 전달됐다는
 보장이 아니며, 취소·저장 실패·권한 상실 시 DB 확정 좌표로 복구해야 한다.
-호출 간 순서나 최종 UPDATE와의 수신 순서는 이 API가 보장하지 않는다. FE #97에서
+호출 간 순서나 최종 UPDATE와의 수신 순서는 이 API가 보장하지 않는다. FE는
+`sent_at`을 임시 메시지끼리 비교하고 Postgres Changes의 `commit_timestamp`보다
+오래된 임시 좌표를 무시한다. 같은 토큰의 송신과 최종 저장 요청은 FE에서 직렬화한다. FE #97에서
 대기 요청과 늦은 메시지의 처리를 구현하고 통합 검증한다.
 
 ## 직접 송신과 적용 순서
